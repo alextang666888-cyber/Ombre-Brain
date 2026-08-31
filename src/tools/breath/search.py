@@ -331,12 +331,14 @@ async def surface_search(
                 bucket, header, _footprint(bucket)
             )
         elif bucket.get("vector_match"):
-            header = f"[语义关联] [bucket_id:{bucket_id}]"
+            _created = (meta.get("created") or "")[:10]
+            header = f"[语义关联] [{_created}] [bucket_id:{bucket_id}]"
             rendered, entry_tokens = render_stored_bucket(
                 bucket, header, _footprint(bucket)
             )
         else:
-            header = f"[bucket_id:{bucket_id}]"
+            _created = (meta.get("created") or "")[:10]
+            header = f"[{_created}] [bucket_id:{bucket_id}]"
             rendered, entry_tokens = render_stored_bucket(
                 bucket, header, _footprint(bucket)
             )

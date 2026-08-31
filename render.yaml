@@ -48,13 +48,9 @@ services:
     buildCommand: pip install -r companion/requirements.txt
     startCommand: python companion/server.py
     envVars:
-      - key: ANTHROPIC_API_KEY
-        sync: false          # Set in Render dashboard
-      - key: COMPANION_MODEL
-        value: claude-sonnet-4-6
-      - key: COMPANION_SYSTEM_PROMPT
-        sync: false          # Set in Render dashboard
-      - key: OMBRE_BRAIN_URL
-        sync: false          # e.g. https://ombre-brain.onrender.com
-      - key: COMPANION_PORT
-        value: "10000"       # Render expects port 10000
+      - key: COMPANION_DATA_DIR
+        value: /opt/render/project/src/companion-data
+    disk:
+      name: companion-data
+      mountPath: /opt/render/project/src/companion-data
+      sizeGB: 1

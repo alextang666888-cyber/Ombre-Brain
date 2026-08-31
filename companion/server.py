@@ -6,8 +6,10 @@ import os
 import json
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Optional
+from copy import deepcopy
 
 import anthropic
 import httpx
@@ -22,116 +24,237 @@ from starlette.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("companion")
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-OMBRE_BRAIN_URL = os.environ.get("OMBRE_BRAIN_URL", "http://localhost:8765")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL = os.environ.get("COMPANION_MODEL", "claude-sonnet-4-6")
 STATIC_DIR = Path(__file__).parent / "static"
-
-SYSTEM_PROMPT = os.environ.get("COMPANION_SYSTEM_PROMPT", "")
+DATA_DIR = Path(os.environ.get("COMPANION_DATA_DIR", str(Path(__file__).parent / "data")))
+SETTINGS_FILE = DATA_DIR / "settings.json"
+PROMPT_HISTORY_FILE = DATA_DIR / "prompt_history.json"
 
 # ---------------------------------------------------------------------------
-# Ombre-Brain MCP HTTP proxy — call breath / hold etc. via REST
+# Settings persistence
 # ---------------------------------------------------------------------------
 
-TOOL_DEFS = [
-    {
-        "name": "breath",
-        "description": "无参数,浮现权重最高的未消化记忆和核心准则。",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "breath_search",
-        "description": "按关键词/语义检索记忆。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "搜索关键词"},
-                "max_results": {"type": "integer", "default": 10},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "hold",
-        "description": "存入一条新记忆。需要阿凌确认后才存。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "记忆正文"},
-                "importance": {"type": "number", "default": 5},
-                "valence": {"type": "number", "default": 0},
-                "arousal": {"type": "number", "default": 0},
-                "domain": {"type": "string", "default": ""},
-                "tags": {"type": "string", "default": ""},
-            },
-            "required": ["content"],
-        },
-    },
-    {
-        "name": "feel",
-        "description": "查看当前情绪坐标。",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "dream",
-        "description": "触发记忆整合/梦境。",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "letter_read",
-        "description": "读信件/日记。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "日期 YYYY-MM-DD，留空读最新"},
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "letter_write",
-        "description": "写日记。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "日期 YYYY-MM-DD"},
-                "content": {"type": "string", "description": "日记内容"},
-            },
-            "required": ["date", "content"],
-        },
-    },
-    {
-        "name": "I",
-        "description": "写一条自我发现（候选态）。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "自我发现内容"},
-            },
-            "required": ["content"],
-        },
-    },
-]
+DEFAULT_SETTINGS = {
+    "api_key": "",
+    "model": "claude-sonnet-4-6",
+    "system_prompt": "",
+    "mcp_servers": [],
+}
 
 
-async def call_ombre_tool(tool_name: str, tool_input: dict) -> str:
-    """Call an Ombre-Brain tool via its HTTP API."""
+def _ensure_data_dir():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_settings() -> dict:
+    _ensure_data_dir()
+    if SETTINGS_FILE.exists():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text("utf-8"))
+            merged = {**DEFAULT_SETTINGS, **data}
+            return merged
+        except Exception:
+            logger.exception("Failed to load settings")
+    return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(settings: dict):
+    _ensure_data_dir()
+    SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), "utf-8")
+
+
+def load_prompt_history() -> list:
+    if PROMPT_HISTORY_FILE.exists():
+        try:
+            return json.loads(PROMPT_HISTORY_FILE.read_text("utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def save_prompt_history(history: list):
+    _ensure_data_dir()
+    PROMPT_HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), "utf-8")
+
+
+# ---------------------------------------------------------------------------
+# MCP server tool discovery & execution
+# ---------------------------------------------------------------------------
+
+async def discover_tools(server: dict) -> list:
+    """Fetch tool list from an MCP-compatible HTTP server."""
+    url = server["url"].rstrip("/")
+    async with httpx.AsyncClient(timeout=10) as http:
+        try:
+            resp = await http.get(f"{url}/api/tools")
+            if resp.status_code == 200:
+                tools = resp.json()
+                if isinstance(tools, list):
+                    return tools
+            resp2 = await http.post(f"{url}/mcp", json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/list", "params": {}
+            })
+            if resp2.status_code == 200:
+                data = resp2.json()
+                return data.get("result", {}).get("tools", [])
+        except Exception as e:
+            logger.warning(f"Tool discovery failed for {server.get('name','?')}: {e}")
+    return []
+
+
+async def call_mcp_tool(server: dict, tool_name: str, tool_input: dict) -> str:
+    """Call a tool on an MCP server via HTTP."""
+    url = server["url"].rstrip("/")
     async with httpx.AsyncClient(timeout=30) as http:
         try:
-            resp = await http.post(
-                f"{OMBRE_BRAIN_URL}/api/tool/{tool_name}",
-                json=tool_input,
-            )
+            resp = await http.post(f"{url}/api/tool/{tool_name}", json=tool_input)
             if resp.status_code == 200:
-                data = resp.json()
-                return json.dumps(data, ensure_ascii=False)
+                return json.dumps(resp.json(), ensure_ascii=False)
+            resp2 = await http.post(f"{url}/mcp", json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": tool_input}
+            })
+            if resp2.status_code == 200:
+                data = resp2.json()
+                result = data.get("result", data)
+                return json.dumps(result, ensure_ascii=False)
             return json.dumps({"error": f"HTTP {resp.status_code}", "body": resp.text})
         except Exception as e:
             return json.dumps({"error": str(e)})
+
+
+def build_tool_defs_and_router(settings: dict) -> tuple[list, dict]:
+    """Return (tool_defs_for_claude, {tool_name: server_config})."""
+    return [], {}
+
+
+async def refresh_tools(settings: dict) -> tuple[list, dict]:
+    """Discover tools from all configured MCP servers."""
+    all_tools = []
+    router = {}
+    for server in settings.get("mcp_servers", []):
+        if not server.get("enabled", True):
+            continue
+        tools = await discover_tools(server)
+        prefix = server.get("prefix", "")
+        for t in tools:
+            name = t.get("name", "")
+            if not name:
+                continue
+            tool_name = f"{prefix}{name}" if prefix else name
+            tool_def = {
+                "name": tool_name,
+                "description": t.get("description", ""),
+                "input_schema": t.get("inputSchema", t.get("input_schema",
+                    {"type": "object", "properties": {}, "required": []})),
+            }
+            all_tools.append(tool_def)
+            router[tool_name] = {"server": server, "original_name": name}
+    return all_tools, router
+
+
+# ---------------------------------------------------------------------------
+# Settings API
+# ---------------------------------------------------------------------------
+
+async def get_settings(request: Request):
+    settings = load_settings()
+    safe = {**settings}
+    if safe.get("api_key"):
+        key = safe["api_key"]
+        safe["api_key_preview"] = key[:8] + "…" + key[-4:] if len(key) > 12 else "***"
+    else:
+        safe["api_key_preview"] = ""
+    safe.pop("api_key", None)
+    return JSONResponse(safe)
+
+
+async def update_settings(request: Request):
+    body = await request.json()
+    settings = load_settings()
+    old_prompt = settings.get("system_prompt", "")
+
+    if "api_key" in body:
+        settings["api_key"] = body["api_key"]
+    if "model" in body:
+        settings["model"] = body["model"]
+    if "system_prompt" in body:
+        new_prompt = body["system_prompt"]
+        if new_prompt != old_prompt:
+            history = load_prompt_history()
+            history.append({
+                "prompt": old_prompt,
+                "timestamp": time.time(),
+                "label": body.get("prompt_label", ""),
+            })
+            if len(history) > 50:
+                history = history[-50:]
+            save_prompt_history(history)
+        settings["system_prompt"] = new_prompt
+
+    save_settings(settings)
+    return JSONResponse({"ok": True})
+
+
+async def get_prompt_history(request: Request):
+    return JSONResponse(load_prompt_history())
+
+
+# ---------------------------------------------------------------------------
+# MCP servers management API
+# ---------------------------------------------------------------------------
+
+async def list_mcp_servers(request: Request):
+    settings = load_settings()
+    return JSONResponse(settings.get("mcp_servers", []))
+
+
+async def add_mcp_server(request: Request):
+    body = await request.json()
+    name = body.get("name", "").strip()
+    url = body.get("url", "").strip()
+    if not name or not url:
+        return JSONResponse({"error": "name and url required"}, status_code=400)
+
+    settings = load_settings()
+    server = {
+        "name": name,
+        "url": url,
+        "prefix": body.get("prefix", ""),
+        "enabled": True,
+    }
+    settings.setdefault("mcp_servers", []).append(server)
+    save_settings(settings)
+    return JSONResponse({"ok": True, "server": server})
+
+
+async def remove_mcp_server(request: Request):
+    body = await request.json()
+    name = body.get("name", "")
+    settings = load_settings()
+    servers = settings.get("mcp_servers", [])
+    settings["mcp_servers"] = [s for s in servers if s.get("name") != name]
+    save_settings(settings)
+    return JSONResponse({"ok": True})
+
+
+async def toggle_mcp_server(request: Request):
+    body = await request.json()
+    name = body.get("name", "")
+    settings = load_settings()
+    for s in settings.get("mcp_servers", []):
+        if s.get("name") == name:
+            s["enabled"] = not s.get("enabled", True)
+    save_settings(settings)
+    return JSONResponse({"ok": True})
+
+
+async def test_mcp_server(request: Request):
+    body = await request.json()
+    server = {"name": "test", "url": body.get("url", ""), "prefix": ""}
+    tools = await discover_tools(server)
+    return JSONResponse({"ok": True, "tools": tools})
 
 
 # ---------------------------------------------------------------------------
@@ -139,30 +262,38 @@ async def call_ombre_tool(tool_name: str, tool_input: dict) -> str:
 # ---------------------------------------------------------------------------
 
 async def chat_stream(request: Request):
-    """SSE endpoint: receives messages, streams Claude response with tool use."""
     body = await request.json()
     messages = body.get("messages", [])
-    system = body.get("system", SYSTEM_PROMPT)
+    settings = load_settings()
+    system = body.get("system", settings.get("system_prompt", ""))
+    api_key = settings.get("api_key", "")
+    model = settings.get("model", "claude-sonnet-4-6")
 
-    if not ANTHROPIC_API_KEY:
-        return JSONResponse({"error": "ANTHROPIC_API_KEY not set"}, status_code=500)
+    if not api_key:
+        return JSONResponse({"error": "API key 未设置，请在设置中填写"}, status_code=400)
 
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    tool_defs, router = await refresh_tools(settings)
+
+    client = anthropic.AsyncAnthropic(api_key=api_key)
 
     async def event_generator():
         conversation = list(messages)
         max_tool_rounds = 10
 
+        kwargs = dict(
+            model=model,
+            max_tokens=16000,
+            messages=conversation,
+            thinking={"type": "adaptive"},
+        )
+        if system:
+            kwargs["system"] = system
+        if tool_defs:
+            kwargs["tools"] = tool_defs
+
         for _round in range(max_tool_rounds):
             try:
-                async with client.messages.stream(
-                    model=MODEL,
-                    max_tokens=16000,
-                    system=system,
-                    messages=conversation,
-                    tools=TOOL_DEFS,
-                    thinking={"type": "adaptive"},
-                ) as stream:
+                async with client.messages.stream(**kwargs) as stream:
                     tool_use_blocks = []
                     current_text = ""
 
@@ -184,7 +315,6 @@ async def chat_stream(request: Request):
 
                     response = stream.get_final_message()
 
-                # Collect tool use blocks
                 for block in response.content:
                     if block.type == "tool_use":
                         tool_use_blocks.append(block)
@@ -193,13 +323,18 @@ async def chat_stream(request: Request):
                     yield f"data: {json.dumps({'type': 'done', 'stop_reason': response.stop_reason})}\n\n"
                     return
 
-                # Execute tools and continue conversation
                 conversation.append({"role": "assistant", "content": response.content})
 
                 tool_results = []
                 for tool_block in tool_use_blocks:
                     yield f"data: {json.dumps({'type': 'tool_exec', 'name': tool_block.name})}\n\n"
-                    result = await call_ombre_tool(tool_block.name, tool_block.input)
+                    route = router.get(tool_block.name)
+                    if route:
+                        result = await call_mcp_tool(
+                            route["server"], route["original_name"], tool_block.input
+                        )
+                    else:
+                        result = json.dumps({"error": f"Unknown tool: {tool_block.name}"})
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_block.id,
@@ -208,6 +343,7 @@ async def chat_stream(request: Request):
                     yield f"data: {json.dumps({'type': 'tool_result', 'name': tool_block.name})}\n\n"
 
                 conversation.append({"role": "user", "content": tool_results})
+                kwargs["messages"] = conversation
 
             except Exception as e:
                 logger.exception("Stream error")
@@ -233,7 +369,13 @@ async def index(request: Request):
 
 
 async def health(request: Request):
-    return JSONResponse({"status": "ok", "model": MODEL})
+    settings = load_settings()
+    return JSONResponse({
+        "status": "ok",
+        "model": settings.get("model", ""),
+        "has_api_key": bool(settings.get("api_key")),
+        "mcp_servers": len([s for s in settings.get("mcp_servers", []) if s.get("enabled", True)]),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +387,14 @@ app = Starlette(
         Route("/", index),
         Route("/health", health),
         Route("/api/chat", chat_stream, methods=["POST"]),
+        Route("/api/settings", get_settings, methods=["GET"]),
+        Route("/api/settings", update_settings, methods=["PUT"]),
+        Route("/api/prompt-history", get_prompt_history, methods=["GET"]),
+        Route("/api/mcp-servers", list_mcp_servers, methods=["GET"]),
+        Route("/api/mcp-servers", add_mcp_server, methods=["POST"]),
+        Route("/api/mcp-servers/remove", remove_mcp_server, methods=["POST"]),
+        Route("/api/mcp-servers/toggle", toggle_mcp_server, methods=["POST"]),
+        Route("/api/mcp-servers/test", test_mcp_server, methods=["POST"]),
         Mount("/static", app=StaticFiles(directory=str(STATIC_DIR)), name="static"),
     ],
     middleware=[

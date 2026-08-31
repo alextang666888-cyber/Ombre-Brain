@@ -39,3 +39,22 @@ services:
       name: ombre-buckets
       mountPath: /opt/render/project/src/buckets
       sizeGB: 1              # Keep the existing 1 GB disk to avoid increasing monthly cost
+
+  - type: web
+    name: songdu-companion
+    runtime: python
+    region: singapore
+    plan: starter
+    buildCommand: pip install -r companion/requirements.txt
+    startCommand: python companion/server.py
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false          # Set in Render dashboard
+      - key: COMPANION_MODEL
+        value: claude-sonnet-4-6
+      - key: COMPANION_SYSTEM_PROMPT
+        sync: false          # Set in Render dashboard
+      - key: OMBRE_BRAIN_URL
+        sync: false          # e.g. https://ombre-brain.onrender.com
+      - key: COMPANION_PORT
+        value: "10000"       # Render expects port 10000

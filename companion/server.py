@@ -259,5 +259,5 @@ app = Starlette(
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("COMPANION_PORT", "8766"))
+    port = int(os.environ.get("PORT", os.environ.get("COMPANION_PORT", "8766")))
     uvicorn.run(app, host="0.0.0.0", port=port)

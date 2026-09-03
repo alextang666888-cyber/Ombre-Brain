@@ -39,3 +39,18 @@ services:
       name: ombre-buckets
       mountPath: /opt/render/project/src/buckets
       sizeGB: 1              # Keep the existing 1 GB disk to avoid increasing monthly cost
+
+  - type: web
+    name: songdu-companion
+    runtime: python
+    region: singapore
+    plan: starter
+    buildCommand: pip install -r companion/requirements.txt
+    startCommand: python companion/server.py
+    envVars:
+      - key: COMPANION_DATA_DIR
+        value: /opt/render/project/src/companion-data
+    disk:
+      name: companion-data
+      mountPath: /opt/render/project/src/companion-data
+      sizeGB: 1

@@ -402,9 +402,10 @@ async def surface_default(
         for b in candidates:
             try:
                 score = rt.decay_engine.calculate_score(b["metadata"])
+                _created = (b["metadata"].get("created") or "")[:10]
                 rendered, entry_tokens = render_stored_bucket(
                     b,
-                    f"[权重:{score:.2f}] [bucket_id:{b['id']}]",
+                    f"[权重:{score:.2f}] [{_created}] [bucket_id:{b['id']}]",
                     _footprint(b),
                 )
                 if entry_tokens > token_budget:
@@ -484,9 +485,10 @@ async def surface_default(
             random.shuffle(passive_pool)
             for b in passive_pool[:2]:
                 try:
+                    _created = (b["metadata"].get("created") or "")[:10]
                     rendered, entry_tokens = render_stored_bucket(
                         b,
-                        f"💤 [久未浮现] [bucket_id:{b['id']}]",
+                        f"💤 [久未浮现] [{_created}] [bucket_id:{b['id']}]",
                         _footprint(b),
                     )
                     if entry_tokens > token_budget:
@@ -521,9 +523,10 @@ async def surface_default(
                 random.shuffle(resolved_pool)
                 for b in resolved_pool[:3]:
                     try:
+                        _created = (b["metadata"].get("created") or "")[:10]
                         rendered, entry_tokens = render_stored_bucket(
                             b,
-                            f"✨ [偶遇] [bucket_id:{b['id']}]",
+                            f"✨ [偶遇] [{_created}] [bucket_id:{b['id']}]",
                             _footprint(b),
                         )
                         if entry_tokens > token_budget:
@@ -537,6 +540,8 @@ async def surface_default(
             rt.logger.warning(f"Dream surface block failed / 偶遇模块异常: {e}")
 
     parts = []
+    _now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    parts.append(f"🕐 当前时间：{_now}")
     if core_filter_notice:
         parts.append(core_filter_notice)
     if pinned_results:
